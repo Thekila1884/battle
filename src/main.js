@@ -1,7 +1,6 @@
 import "./styles.css";
 import { connectFirebase, firebaseConfigured, waitForDatabase } from "./firebase.js";
 import {
-  canJoinRoom,
   canStart,
   createRoomState,
   distance,
@@ -15,7 +14,6 @@ import {
 } from "./game/engine.js";
 import { modeById, modes } from "./game/modes/index.js";
 import {
-  get,
   onValue,
   ref,
   runTransaction,
@@ -103,30 +101,62 @@ async function joinRoom(form) {
   try {
     const { database, user } = await ensureConnection();
     const roomRef = ref(database, `rooms/${code}`);
-    const roomSnapshot = await get(roomRef);
-    if (!roomSnapshot.exists()) throw new Error("La sala no existe.");
     let joinFailure = "";
-    const result = await runTransaction(roomRef, (current) => {
-      if (!current) {
-        joinFailure = "La sala no existe.";
-        return;
-      }
-      if (current.players?.[user.uid]) {
-        joinFailure = "Esta cuenta ya está en la sala.";
-        return;
-      }
-      if (current.status !== "lobby") {
-        joinFailure = "La partida ya empezó.";
-        return;
-      }
-      if (Object.keys(current.players ?? {}).length >= MAX_PLAYERS) {
-        joinFailure = "La sala está llena.";
-        return;
-      }
-      joinFailure = "";
-      return nextPlayer(current, user.uid, userName);
+    await new Promise((resolve, reject) => {
+      let transactionStarted = false;
+      let unsubscribe = () => {};
+
+      unsubscribe = onValue(
+        roomRef,
+        (snapshot) => {
+          if (transactionStarted) return;
+          if (!snapshot.exists()) {
+            unsubscribe();
+            reject(new Error("La sala no existe."));
+            return;
+          }
+
+          transactionStarted = true;
+          void runTransaction(roomRef, (current) => {
+            if (!current) {
+              joinFailure = "La sala ya no está disponible.";
+              return;
+            }
+            if (current.players?.[user.uid]) {
+              joinFailure = "Esta cuenta ya está en la sala.";
+              return;
+            }
+            if (current.status !== "lobby") {
+              joinFailure = "La partida ya empezó.";
+              return;
+            }
+            if (Object.keys(current.players ?? {}).length >= MAX_PLAYERS) {
+              joinFailure = "La sala está llena.";
+              return;
+            }
+            joinFailure = "";
+            return nextPlayer(current, user.uid, userName);
+          }).then(
+            (result) => {
+              unsubscribe();
+              if (!result.committed) {
+                reject(new Error(joinFailure || "No se pudo completar la entrada a la sala."));
+                return;
+              }
+              resolve(result);
+            },
+            (error) => {
+              unsubscribe();
+              reject(error);
+            }
+          );
+        },
+        (error) => {
+          unsubscribe();
+          reject(new Error(`No se pudo leer la sala: ${error.message}`));
+        }
+      );
     });
-    if (!result.committed) throw new Error(joinFailure || "No se pudo completar la entrada a la sala.");
     enterRoom(database, code, user.uid);
   } catch (error) {
     showNotice(error.message);
