@@ -35,6 +35,10 @@ let busy = false;
 
 render();
 
+function diagnostic(event, details = {}) {
+  console.info(`[Battleweb] ${event}`, details);
+}
+
 app.addEventListener("submit", (event) => {
   event.preventDefault();
   const form = event.target;
@@ -63,9 +67,11 @@ async function ensureConnection() {
     throw new Error("Configura Firebase para crear o unirte a una sala en línea.");
   }
   if (!connection) {
+    diagnostic("firebase.connect.start");
     const initialized = await connectFirebase();
     await waitForDatabase(initialized.database);
     connection = initialized;
+    diagnostic("firebase.connect.ready");
   }
   return connection;
 }
@@ -96,6 +102,7 @@ async function joinRoom(form) {
   const code = String(data.get("code") || "").trim().toUpperCase();
   if (!userName) return showNotice("Escribe un nombre de piloto.");
   if (!/^[A-Z0-9]{6}$/.test(code)) return showNotice("El código debe tener 6 letras o números.");
+  diagnostic("room.join.start", { code });
   busy = true;
   render();
   try {
@@ -105,60 +112,111 @@ async function joinRoom(form) {
     await new Promise((resolve, reject) => {
       let transactionStarted = false;
       let unsubscribe = () => {};
+      let transactionAttempts = 0;
+      const timeoutId = setTimeout(() => {
+        diagnostic("room.join.timeout", { code, stage: transactionStarted ? "transaction" : "room-listener" });
+        unsubscribe();
+        reject(new Error("Se agotó el tiempo de espera al entrar. Comprueba tu conexión e inténtalo otra vez."));
+      }, 12000);
+
+      const finish = (error, result) => {
+        clearTimeout(timeoutId);
+        unsubscribe();
+        if (error) reject(error);
+        else resolve(result);
+      };
 
       unsubscribe = onValue(
         roomRef,
         (snapshot) => {
           if (transactionStarted) return;
           if (!snapshot.exists()) {
-            unsubscribe();
-            reject(new Error("La sala no existe."));
+            diagnostic("room.join.snapshot.missing", { code });
+            finish(new Error("La sala no existe en esta base de datos. Verifica el código y que ambos estén usando el mismo proyecto."));
             return;
           }
 
           transactionStarted = true;
+          const initialRoom = snapshot.val();
+          diagnostic("room.join.snapshot.loaded", {
+            code,
+            status: initialRoom.status ?? "unknown",
+            playerCount: Object.keys(initialRoom.players ?? {}).length,
+          });
           void runTransaction(roomRef, (current) => {
+            transactionAttempts += 1;
             if (!current) {
-              joinFailure = "La sala ya no está disponible.";
+              joinFailure = "Firebase no pudo cargar el estado de la sala. Inténtalo otra vez.";
+              diagnostic("room.join.transaction.empty", { code, attempt: transactionAttempts });
               return;
             }
             if (current.players?.[user.uid]) {
               joinFailure = "Esta cuenta ya está en la sala.";
+              diagnostic("room.join.transaction.rejected", { code, reason: "already-joined" });
               return;
             }
             if (current.status !== "lobby") {
               joinFailure = "La partida ya empezó.";
+              diagnostic("room.join.transaction.rejected", { code, reason: "game-started" });
               return;
             }
             if (Object.keys(current.players ?? {}).length >= MAX_PLAYERS) {
               joinFailure = "La sala está llena.";
+              diagnostic("room.join.transaction.rejected", { code, reason: "room-full" });
               return;
             }
             joinFailure = "";
+            diagnostic("room.join.transaction.write", {
+              code,
+              attempt: transactionAttempts,
+              playerCount: Object.keys(current.players ?? {}).length,
+            });
             return nextPlayer(current, user.uid, userName);
           }).then(
             (result) => {
-              unsubscribe();
               if (!result.committed) {
-                reject(new Error(joinFailure || "No se pudo completar la entrada a la sala."));
+                diagnostic("room.join.transaction.aborted", {
+                  code,
+                  attempts: transactionAttempts,
+                  reason: joinFailure || "unknown",
+                });
+                finish(new Error(joinFailure || "No se pudo completar la entrada a la sala."));
                 return;
               }
-              resolve(result);
+              diagnostic("room.join.success", {
+                code,
+                attempts: transactionAttempts,
+                playerCount: Object.keys(result.snapshot.val()?.players ?? {}).length,
+              });
+              finish(null, result);
             },
             (error) => {
-              unsubscribe();
-              reject(error);
+              diagnostic("room.join.transaction.error", {
+                code,
+                errorCode: error.code ?? "unknown",
+                message: error.message,
+              });
+              finish(error);
             }
           );
         },
         (error) => {
-          unsubscribe();
-          reject(new Error(`No se pudo leer la sala: ${error.message}`));
+          diagnostic("room.join.read.error", {
+            code,
+            errorCode: error.code ?? "unknown",
+            message: error.message,
+          });
+          finish(new Error(`No se pudo leer la sala: ${error.message}`));
         }
       );
     });
     enterRoom(database, code, user.uid);
   } catch (error) {
+    diagnostic("room.join.failure", {
+      code,
+      errorCode: error.code ?? "unknown",
+      message: error.message,
+    });
     showNotice(error.message);
   } finally {
     busy = false;
@@ -389,71 +447,44 @@ function cleanName(value) {
 }
 
 function render() {
+  document.body.classList.toggle("main-menu-open", !room);
   app.innerHTML = room ? renderRoom() : renderHome();
 }
 
 function renderHome() {
-  const setupWarning = firebaseConfigured ? "" : `
-    <div class="setup-note">
-      <span class="setup-dot"></span>
-      <span><strong>Firebase aún no está conectado.</strong> Completa <code>.env.local</code> para habilitar las salas en línea.</span>
-    </div>`;
+  const setupWarning = firebaseConfigured ? "" : `<p class="menu-message is-warning" role="status">Firebase no está configurado. Completa <code>.env.local</code> para activar el multijugador.</p>`;
   return `
-    <main class="site-shell">
-      <header class="topbar">
-        <a class="brand" href="#" aria-label="Battleweb inicio"><span class="brand-mark">B</span><span>BATTLE<span class="brand-light">WEB</span></span></a>
-        <div class="topbar-right"><span class="online-indicator"></span><span>ARENA EN LÍNEA</span><span class="topbar-divider"></span><span>v0.1 — BETA</span></div>
-      </header>
-      <section class="hero">
-        <div class="hero-copy">
-          <div class="eyebrow"><span class="eyebrow-line"></span> ESTRATEGIA. INSTINTO. SUPERVIVENCIA.</div>
-          <h1>La arena<br />es <em>tuya.</em></h1>
-          <p class="hero-description">Elige tu movimiento. Fija el objetivo. Todo ocurre a la vez. ¿Te adelantarás a los demás?</p>
-          <div class="hero-meta"><span><span class="meta-icon">◈</span> 2–8 PILOTOS</span><span><span class="meta-icon">◷</span> 5–10 MIN</span><span><span class="meta-icon">⌘</span> RONDAS SIMULTÁNEAS</span></div>
+    <main class="main-menu-container">
+      <div class="bg-grid" aria-hidden="true"></div>
+      <div class="bg-glow" aria-hidden="true"></div>
+      <section class="menu-content">
+        <header class="brand-header">
+          <span class="badge">ESTRATEGIA · INSTINTO · SUPERVIVENCIA</span>
+          <h1 class="game-title">BATTLEWEB</h1>
+          <p class="game-subtitle">La arena es tuya. Cada ronda, una decisión.</p>
+        </header>
+        <div class="actions-card">
+          ${setupWarning}
+          ${notice ? `<div class="menu-message is-error" role="alert">${escapeHtml(notice)}<button data-action="dismiss-notice" aria-label="Cerrar">×</button></div>` : ""}
+          <form data-create-form class="primary-actions">
+            <label class="sr-only" for="create-name">Tu nombre de piloto</label>
+            <input id="create-name" class="menu-input" name="name" maxlength="18" placeholder="Tu nombre de piloto" autocomplete="nickname" required />
+            <label class="menu-select-wrap"><span class="sr-only">Modo de juego</span><select name="mode">${playableModes.map((mode) => `<option value="${mode.id}">${escapeHtml(mode.label)}</option>`).join("")}</select><span aria-hidden="true">⌄</span></label>
+            <button class="btn btn-primary" type="submit" ${busy || !firebaseConfigured ? "disabled" : ""}>${busy ? "CONECTANDO…" : "CREAR SALA"}</button>
+          </form>
+          <div class="divider"></div>
+          <form data-join-form class="primary-actions">
+            <label class="sr-only" for="join-name">Tu nombre de piloto</label>
+            <input id="join-name" class="menu-input" name="name" maxlength="18" placeholder="Tu nombre de piloto" autocomplete="nickname" required />
+            <div class="join-group">
+              <label class="sr-only" for="room-code">Código de sala</label>
+              <input id="room-code" class="input-code" name="code" maxlength="6" placeholder="CÓDIGO" autocomplete="off" required />
+              <button class="btn btn-secondary" type="submit" ${busy || !firebaseConfigured ? "disabled" : ""}>UNIRSE</button>
+            </div>
+          </form>
         </div>
-        <div class="hero-art" aria-hidden="true">
-          <div class="orbit orbit-one"></div><div class="orbit orbit-two"></div>
-          <div class="hero-crosshair">+</div><div class="hero-coordinate">04 : 04<br /><span>SECTOR CENTRAL</span></div>
-          <div class="hero-target"><span></span></div><div class="hero-ship ship-one">▲</div><div class="hero-ship ship-two">◆</div><div class="hero-ship ship-three">▲</div>
-          <div class="hero-blip blip-one"></div><div class="hero-blip blip-two"></div><div class="hero-blip blip-three"></div>
-        </div>
+        <footer class="server-status"><span class="status-indicator ${firebaseConfigured ? "online" : ""}"></span><span>${firebaseConfigured ? `ARENA EN LÍNEA · HASTA ${MAX_PLAYERS} PILOTOS` : "FIREBASE SIN CONFIGURAR"}</span><span class="font-mono">· 2 MODOS</span></footer>
       </section>
-      ${setupWarning}
-      ${notice ? `<div class="notice" role="status">${escapeHtml(notice)}<button data-action="dismiss-notice" aria-label="Cerrar">×</button></div>` : ""}
-      <section class="play-section">
-        <div class="section-heading"><span class="section-index">01 / CONECTA</span><span class="section-rule"></span><span class="section-caption">REÚNE A TU ESCUADRA</span></div>
-        <div class="play-cards">
-          <article class="play-card create-card">
-            <div class="card-topline"><span class="card-icon">↗</span><span class="card-label">ANFITRIÓN</span></div>
-            <h2>Crea una sala</h2><p>Elige las reglas y comparte tu código de invitación.</p>
-            <form data-create-form class="card-form">
-              <label class="sr-only" for="create-name">Tu nombre</label><input id="create-name" name="name" maxlength="18" placeholder="Tu nombre de piloto" autocomplete="nickname" required />
-              <label class="select-wrap"><span class="sr-only">Modo de juego</span><select name="mode">${playableModes.map((mode) => `<option value="${mode.id}">${escapeHtml(mode.label)} — ${escapeHtml(mode.description)}</option>`).join("")}</select><span class="select-chevron">⌄</span></label>
-              <button class="button button-primary" type="submit" ${busy || !firebaseConfigured ? "disabled" : ""}><span>${busy ? "CONECTANDO…" : "CREAR SALA"}</span><span class="button-arrow">↗</span></button>
-            </form>
-            <div class="card-footnote"><span>◉</span> Partida privada · Hasta ${MAX_PLAYERS} pilotos</div>
-          </article>
-          <article class="play-card join-card">
-            <div class="card-topline"><span class="card-icon join-icon">⌁</span><span class="card-label">INVITADO</span></div>
-            <h2>Únete a una sala</h2><p>¿Ya tienes un código? Entra directo a la batalla.</p>
-            <form data-join-form class="card-form">
-              <label class="sr-only" for="join-name">Tu nombre</label><input id="join-name" name="name" maxlength="18" placeholder="Tu nombre de piloto" autocomplete="nickname" required />
-              <label class="sr-only" for="room-code">Código de sala</label><input id="room-code" class="code-input" name="code" maxlength="6" placeholder="CÓDIGO" autocomplete="off" required />
-              <button class="button button-secondary" type="submit" ${busy || !firebaseConfigured ? "disabled" : ""}><span>ENTRAR A LA SALA</span><span class="button-arrow">→</span></button>
-            </form>
-            <div class="card-footnote"><span>◉</span> Sin descargas · Juega desde el navegador</div>
-          </article>
-        </div>
-      </section>
-      <section class="how-section">
-        <div class="section-heading"><span class="section-index">02 / DOMINA</span><span class="section-rule"></span><span class="section-caption">FÁCIL DE APRENDER. DIFÍCIL DE ANTICIPAR.</span></div>
-        <div class="steps">
-          <div class="step"><span class="step-number">01</span><div><h3>Planea</h3><p>Muévete una casilla y elige tu arma.</p></div></div>
-          <div class="step"><span class="step-number">02</span><div><h3>Apunta</h3><p>Fija un objetivo antes de que acabe la ronda.</p></div></div>
-          <div class="step"><span class="step-number">03</span><div><h3>Resuelve</h3><p>Cuando todos confirman, la arena responde.</p></div></div>
-        </div>
-      </section>
-      <footer class="footer"><span>© 2026 BATTLEWEB</span><span>HECHO PARA JUGAR EN EQUIPO <span class="footer-star">✳</span></span><span>WEB MULTIJUGADOR</span></footer>
     </main>`;
 }
 
